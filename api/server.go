@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"sync/atomic"
+	"time"
 
 	"accesssim/policy"
 	"accesssim/store"
@@ -24,6 +25,9 @@ func NewServer(st *store.Store) *Server {
 
 func (s *Server) getStore() *store.Store { return s.store.Load() }
 
+// SwapStore replaces the active store atomically (shared with reset).
+func (s *Server) SwapStore(st *store.Store) { s.store.Store(st) }
+
 // NewDefaultServer seeds the simulator with the diamond-inheritance demo.
 func NewDefaultServer() *Server {
 	st, err := store.New(DemoDocument())
@@ -40,6 +44,8 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/preview", s.handlePreview)
 	mux.HandleFunc("POST /api/publish", s.handlePublish)
 	mux.HandleFunc("GET /api/decisions/{version}", s.handleDecisions)
+	mux.HandleFunc("GET /api/exceptions", s.handleListExceptions)
+	mux.HandleFunc("POST /api/exceptions", s.handleCreateException)
 	mux.HandleFunc("POST /api/demo/reset", s.handleReset)
 }
 
@@ -134,8 +140,70 @@ func (s *Server) handleDecisions(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// ---- emergency exceptions ----
+
+type tupleReq struct {
+	Role     string `json:"role"`
+	Resource string `json:"resource"`
+	Action   string `json:"action"`
+}
+
+type createExceptionReq struct {
+	Tuple             tupleReq `json:"tuple"`
+	Reason            string   `json:"reason"`
+	TTLMinutes        int      `json:"ttlMinutes"`
+	PublishedRevision int      `json:"publishedRevision"`
+}
+
+// handleCreateException grants a simulated 1–60 minute emergency
+// exception for exactly one published tuple. The store re-adjudicates
+// the tuple against the current published revision inside its mutex:
+// only a tuple that is currently denied can get one, and a request
+// stamped with an outdated publishedRevision is refused.
+func (s *Server) handleCreateException(w http.ResponseWriter, r *http.Request) {
+	var req createExceptionReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	res, err := s.getStore().CreateEmergencyException(&store.CreateExceptionRequest{
+		Tuple: policy.Tuple{
+			Role: req.Tuple.Role, Resource: req.Tuple.Resource, Action: req.Tuple.Action,
+		},
+		Reason:            req.Reason,
+		TTLMinutes:        req.TTLMinutes,
+		PublishedRevision: req.PublishedRevision,
+	})
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"exception": res.Exception,
+		"decision":  res.Decision,
+		"now":       res.Now.Format(time.RFC3339),
+		"message":   "SIMULATED emergency exception created: published decision is temporarily allow; the original deny rule evidence remains attached, and this is NOT a published rule change",
+	})
+}
+
+// handleListExceptions returns active exceptions plus the server-side
+// adjudication clock so the page can render countdowns consistently.
+func (s *Server) handleListExceptions(w http.ResponseWriter, r *http.Request) {
+	pubRev, now, exceptions, err := s.getStore().ListExceptions()
+	if err != nil {
+		writeStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"exceptions":        exceptions,
+		"publishedRevision": pubRev,
+		"now":               now.Format(time.RFC3339),
+	})
+}
+
 // handleReset restores the demo document (draft = published, revision 1).
-// Intended for the UI demo and tests; it atomically swaps the store.
+// Intended for the UI demo and tests; it atomically swaps the store,
+// which also drops every emergency exception immediately.
 func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 	st, err := store.New(DemoDocument())
 	if err != nil {
@@ -184,6 +252,14 @@ func writeStoreError(w http.ResponseWriter, err error) {
 		writeJSON(w, http.StatusConflict, errResp{Error: err.Error(), Code: "summary_mismatch"})
 	case errors.Is(err, store.ErrInvalidSummary):
 		writeJSON(w, http.StatusBadRequest, errResp{Error: err.Error(), Code: "invalid_summary"})
+	case errors.Is(err, store.ErrInvalidException):
+		writeJSON(w, http.StatusUnprocessableEntity, errResp{Error: err.Error(), Code: "invalid_exception"})
+	case errors.Is(err, store.ErrTupleNotDenied):
+		writeJSON(w, http.StatusConflict, errResp{Error: err.Error(), Code: "tuple_not_denied"})
+	case errors.Is(err, store.ErrExceptionExists):
+		writeJSON(w, http.StatusConflict, errResp{Error: err.Error(), Code: "exception_exists"})
+	case errors.Is(err, store.ErrExceptionRevisionMoved):
+		writeJSON(w, http.StatusConflict, errResp{Error: err.Error(), Code: "published_moved"})
 	default:
 		writeError(w, http.StatusInternalServerError, err.Error())
 	}

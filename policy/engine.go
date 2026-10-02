@@ -15,13 +15,24 @@ type RuleRef struct {
 type Evidence struct {
 	// Decision is the resulting effect ("allow" or "deny").
 	Decision string `json:"decision"`
-	// Reason is "single-winner", "tie-deny" or "no-match-default-deny".
+	// Reason is "single-winner", "tie-deny", "no-match-default-deny"
+	// or "emergency-exception-allow".
 	Reason string `json:"reason"`
 	// Considered lists every rule that matched the tuple, highest
 	// priority first. On a tie the winners group is also exposed.
 	Considered []RuleRef `json:"considered"`
 	// Winners are the rules at the decisive (highest matched) priority.
 	Winners []RuleRef `json:"winners"`
+	// ExceptionID is set only on a temporary allow produced by an
+	// active emergency exception. When set, Decision/Reason describe
+	// the override, while Considered/Winners/OriginalReason preserve
+	// the underlying published-policy deny verbatim, so a client can
+	// never display an allow without its exception identity or,
+	// conversely, pure-rule-deny evidence next to an allowed cell.
+	ExceptionID string `json:"exceptionId,omitempty"`
+	// OriginalReason records the pre-override reason (the three rule
+	// reasons above) when ExceptionID is set.
+	OriginalReason string `json:"originalReason,omitempty"`
 }
 
 // Tuple is one point of the finite decision domain.
@@ -32,9 +43,10 @@ type Tuple struct {
 }
 
 const (
-	ReasonSingleWinner = "single-winner"
-	ReasonTieDeny      = "tie-deny"
-	ReasonNoMatch      = "no-match-default-deny"
+	ReasonSingleWinner   = "single-winner"
+	ReasonTieDeny        = "tie-deny"
+	ReasonNoMatch        = "no-match-default-deny"
+	ReasonEmergencyAllow = "emergency-exception-allow"
 )
 
 // Engine holds precomputed indexes for one validated document.
@@ -209,6 +221,15 @@ func (e *Engine) Domain() []Tuple {
 	return out
 }
 
+// Contains reports whether t names concrete members of this engine's
+// finite domain. Decide() on an out-of-domain tuple can still match
+// wildcard rules, so callers that must reject foreign tuples use this.
+func (e *Engine) Contains(t Tuple) bool {
+	return contains(e.roles, t.Role) &&
+		contains(e.resources, t.Resource) &&
+		contains(e.actions, t.Action)
+}
+
 // Decisions evaluates the whole finite domain.
 func (e *Engine) Decisions() map[Tuple]Evidence {
 	out := make(map[Tuple]Evidence, len(e.roles)*len(e.resources)*len(e.actions))
@@ -216,4 +237,20 @@ func (e *Engine) Decisions() map[Tuple]Evidence {
 		out[t] = e.Decide(t)
 	}
 	return out
+}
+
+// ApplyEmergencyException wraps a published-policy deny evidence as a
+// temporary allow. The original rule evidence (considered/winners) and
+// the original deny reason are preserved unchanged; the exception
+// identity is carried on every serialization so an overridden decision
+// can never masquerade as a rule-produced allow.
+func ApplyEmergencyException(ev Evidence, exceptionID string) Evidence {
+	return Evidence{
+		Decision:       EffectAllow,
+		Reason:         ReasonEmergencyAllow,
+		Considered:     ev.Considered,
+		Winners:        ev.Winners,
+		ExceptionID:    exceptionID,
+		OriginalReason: ev.Reason,
+	}
 }

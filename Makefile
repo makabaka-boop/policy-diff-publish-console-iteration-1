@@ -14,6 +14,9 @@ build: web
 test:
 	$(GO) test -race -count=1 ./...
 
+webtest:
+	cd web && npm install && npm test
+
 dev-backend:
 	$(GO) run .
 

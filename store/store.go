@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"accesssim/policy"
 )
@@ -28,14 +29,40 @@ type Versioned struct {
 // Draft and published revisions are independent counters: each draft
 // save bumps the draft revision; each successful publish bumps the
 // published revision (and the published content is replaced wholesale).
+//
+// Emergency exceptions are scoped to exactly one published revision:
+// every publish and demo reset clears them. The single mutex s.mu is
+// the shared version adjudication point — exception create/expire
+// decisions, matrix enumeration and publishing all take it, so the UI
+// can never observe a half-applied state (e.g. an allowed cell whose
+// evidence still looks like a pure rule deny).
 type Store struct {
 	mu        sync.Mutex
 	draft     Versioned
 	published Versioned
+
+	// Emergency exceptions pinned to the current published revision.
+	exceptions []*EmergencyException
+	// exceptionSeq is store-global; ids must never be reused after a
+	// publish/reset purge.
+	exceptionSeq int64
+
+	// now is injectable for deterministic TTL-boundary tests.
+	now func() time.Time
 }
 
 // New seeds draft and published with the same initial document.
 func New(initial *policy.Document) (*Store, error) {
+	return NewWithClock(initial, time.Now)
+}
+
+// NewWithClock seeds the store with an injected clock. Production code
+// uses New (wall clock); tests pass a controllable clock to assert the
+// 1–60 minute TTL boundaries without sleeping.
+func NewWithClock(initial *policy.Document, now func() time.Time) (*Store, error) {
+	if now == nil {
+		now = time.Now
+	}
 	eng, err := policy.NewEngine(initial)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidDocument, err)
@@ -44,8 +71,12 @@ func New(initial *policy.Document) (*Store, error) {
 	return &Store{
 		draft:     Versioned{Document: doc, Revision: 1},
 		published: Versioned{Document: doc.Clone(), Revision: 1},
+		now:       now,
 	}, nil
 }
+
+// ClockNow reports the store's current simulated time.
+func (s *Store) ClockNow() time.Time { return s.now() }
 
 // Snapshot returns deep copies so callers can serialize without the lock.
 func (s *Store) Snapshot() (draft, published Versioned) {
@@ -98,11 +129,23 @@ func (s *Store) Preview() (*policy.Summary, int, int, error) {
 type DecisionRow struct {
 	Tuple    policy.Tuple    `json:"tuple"`
 	Evidence policy.Evidence `json:"evidence"`
+	// Exception is non-nil exactly when Evidence is an active emergency
+	// override. It travels in the same response payload as Evidence, so
+	// matrix colour and evidence view can never be served from two
+	// different adjudication moments.
+	Exception *EmergencyException `json:"exception,omitempty"`
 }
 
 // Decisions evaluates the whole finite domain of the requested version.
+//
+// The published view overlays live (unexpired) emergency exceptions: a
+// currently-denied tuple with an active exception is reported as a
+// temporary allow carrying both the original deny rule evidence and the
+// exception identity. The draft view is computed from the draft rules
+// alone — exceptions never alter draft decisions or previews.
 func (s *Store) Decisions(which string) (int, []DecisionRow, error) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	var doc *policy.Document
 	var rev int
 	switch which {
@@ -111,15 +154,33 @@ func (s *Store) Decisions(which string) (int, []DecisionRow, error) {
 	default:
 		doc, rev = s.published.Document.Clone(), s.published.Revision
 	}
-	s.mu.Unlock()
 
 	eng, err := policy.NewEngine(doc)
 	if err != nil {
 		return 0, nil, err
 	}
+	now := s.now()
+	// Prune-then-read within the same lock acquisition: expiry and the
+	// returned matrix share one version adjudication, no background
+	// task required.
+	live := s.pruneExceptionsLocked(now)
+	byTuple := map[policy.Tuple]*EmergencyException{}
+	if which != "draft" {
+		for _, ex := range live {
+			byTuple[ex.Tuple] = ex
+		}
+	}
+
 	rows := make([]DecisionRow, 0)
 	for _, t := range eng.Domain() {
-		rows = append(rows, DecisionRow{Tuple: t, Evidence: eng.Decide(t)})
+		ev := eng.Decide(t)
+		row := DecisionRow{Tuple: t, Evidence: ev}
+		if ex, ok := byTuple[t]; ok {
+			row.Evidence = policy.ApplyEmergencyException(ev, ex.ID)
+			cp := *ex
+			row.Exception = &cp
+		}
+		rows = append(rows, row)
 	}
 	return rev, rows, nil
 }
@@ -190,6 +251,11 @@ func (s *Store) Publish(draftRev, pubRev int, sum *policy.Summary) (*PublishResu
 		Revision: s.published.Revision + 1,
 	}
 	s.published = newPublished
+	// A new published revision invalidates every emergency exception
+	// immediately, in the same critical section: a late create carrying
+	// the old revision can never attach to this revision, and a matrix
+	// read after publish can never see an exception for old rules.
+	s.exceptions = nil
 
 	sumOut := *fresh
 	return &PublishResult{

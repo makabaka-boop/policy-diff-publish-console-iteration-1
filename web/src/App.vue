@@ -1,11 +1,12 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import { api } from './api.js'
 import RoleEditor from './components/RoleEditor.vue'
 import DomainEditor from './components/DomainEditor.vue'
 import RuleEditor from './components/RuleEditor.vue'
 import PreviewPanel from './components/PreviewPanel.vue'
 import DecisionMatrix from './components/DecisionMatrix.vue'
+import ExceptionsPanel from './components/ExceptionsPanel.vue'
 
 const notice = ref('')
 const draftDoc = ref(null)
@@ -19,6 +20,16 @@ const publishing = ref(false)
 const message = ref(null) // { kind: 'ok' | 'err', text }
 const matrixBump = ref(0)
 const matrixVersion = ref('draft')
+
+// Emergency-exception page state. The server clock anchors countdowns;
+// nowTick only repaints countdown text, while exceptionsDataTick drives
+// actual refetches (expiry is judged lazily by the server).
+const exceptions = ref([])
+const serverNow = ref('')
+const nowTick = ref(0)
+const exceptionsLoading = ref(false)
+let clockTimer = null
+let refreshTimer = null
 
 let roleNameCounter = 0
 
@@ -43,6 +54,24 @@ async function loadState() {
   publishedRevision.value = st.published.revision
   dirty.value = false
   matrixBump.value++
+}
+
+// loadExceptions refetches active exceptions together with the server
+// adjudication clock; the matrix is bumped too so cell colour and
+// exception list cannot disagree.
+async function loadExceptions() {
+  exceptionsLoading.value = true
+  try {
+    const data = await api.exceptions()
+    exceptions.value = data.exceptions || []
+    serverNow.value = data.now
+    publishedRevision.value = data.publishedRevision
+    matrixBump.value++
+  } catch (e) {
+    // Non-fatal: the panel/grid can retry on the next tick.
+  } finally {
+    exceptionsLoading.value = false
+  }
 }
 
 function markDirty() {
@@ -124,6 +153,9 @@ async function publish() {
     })
     flash('ok', `发布成功：新已发布修订 p${res.published.revision}`)
     await loadState()
+    // Publishing atomically invalidates every exception server-side;
+    // resync the panel before anyone can act on stale countdowns.
+    await loadExceptions()
     // The published content is now the just-published draft; regenerate
     // the preview so its revision pair reflects reality.
     preview.value = await api.preview()
@@ -153,8 +185,10 @@ async function resetDemo() {
     publishedRevision.value = st.published.revision
     preview.value = null
     dirty.value = false
-    matrixBump.value++
-    flash('ok', '已重置为内置菱形继承演示策略。')
+    // Reset swaps the whole store: loadExceptions confirms the panel is
+    // empty and both grids are refreshed from one authoritative read.
+    await loadExceptions()
+    flash('ok', '已重置为内置菱形继承演示策略，全部应急例外立即失效。')
   } catch (e) {
     flash('err', e.message)
   } finally {
@@ -162,7 +196,20 @@ async function resetDemo() {
   }
 }
 
-onMounted(loadState)
+onMounted(async () => {
+  await loadState()
+  await loadExceptions()
+  // 1 s repaint tick for countdowns; 5 s authoritative refetch so an
+  // expired exception (or one invalidated by a publish in another tab)
+  // disappears without any manual refresh or background server job.
+  clockTimer = setInterval(() => { nowTick.value++ }, 1000)
+  refreshTimer = setInterval(loadExceptions, 5000)
+})
+
+onBeforeUnmount(() => {
+  clearInterval(clockTimer)
+  clearInterval(refreshTimer)
+})
 </script>
 
 <template>
@@ -223,6 +270,15 @@ onMounted(loadState)
         @publish="publish"
       />
 
+      <ExceptionsPanel
+        :exceptions="exceptions"
+        :published-revision="publishedRevision"
+        :server-now="serverNow"
+        :loading="exceptionsLoading"
+        :now-tick="nowTick"
+        @refresh="loadExceptions"
+      />
+
       <div class="tabs">
         <button :class="['tab', matrixVersion === 'draft' && 'on']" @click="matrixVersion = 'draft'">
           草稿矩阵
@@ -230,8 +286,16 @@ onMounted(loadState)
         <button :class="['tab', matrixVersion === 'published' && 'on']" @click="matrixVersion = 'published'">
           已发布矩阵
         </button>
+        <span v-if="exceptions.length" class="ex-chip">🚑 {{ exceptions.length }} 个例外生效中</span>
       </div>
-      <DecisionMatrix :version="matrixVersion" :bump="matrixBump" />
+      <DecisionMatrix
+        :version="matrixVersion"
+        :bump="matrixBump"
+        :published-revision="publishedRevision"
+        :server-now="serverNow"
+        :now-tick="nowTick"
+        @exception-changed="loadExceptions"
+      />
     </template>
 
     <footer class="footer">

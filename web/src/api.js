@@ -20,5 +20,7 @@ export const api = {
   preview: () => request('/api/preview', { method: 'POST' }),
   publish: (payload) => request('/api/publish', { method: 'POST', body: JSON.stringify(payload) }),
   decisions: (version) => request(`/api/decisions/${version}`),
+  exceptions: () => request('/api/exceptions'),
+  createException: (payload) => request('/api/exceptions', { method: 'POST', body: JSON.stringify(payload) }),
   reset: () => request('/api/demo/reset', { method: 'POST' }),
 }
