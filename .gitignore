@@ -1,0 +1,10 @@
+# Go
+/accesssim
+*.test
+*.out
+
+# Node / Vite
+web/node_modules/
+
+# Keep web/dist tracked: it is embedded into the Go binary via go:embed.
+# The committed build output is regenerated via `make build` / `npm run build`.
