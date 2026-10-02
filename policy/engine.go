@@ -11,17 +11,44 @@ type RuleRef struct {
 	Effect   string `json:"effect"`
 }
 
+// ExceptionRef identifies a simulated emergency exception that overrode
+// a published decision. It never carries rule content: the original rule
+// evidence stays in Evidence.BaseEvidence so students can see both the
+// temporary allow and the real published ruling at the same time.
+type ExceptionRef struct {
+	// ID is the exception's unique identity.
+	ID string `json:"id"`
+	// PublishedRevision is the published revision the exception was
+	// adjudicated against. An exception can never attach to any other
+	// revision.
+	PublishedRevision int `json:"publishedRevision"`
+	// Reason is the mandatory human justification recorded at creation.
+	Reason string `json:"reason"`
+	// ExpiresAt is the RFC3339 instant the override stops applying.
+	ExpiresAt string `json:"expiresAt"`
+}
+
 // Evidence explains exactly how a tuple decision was reached.
 type Evidence struct {
 	// Decision is the resulting effect ("allow" or "deny").
 	Decision string `json:"decision"`
-	// Reason is "single-winner", "tie-deny" or "no-match-default-deny".
+	// Reason is "single-winner", "tie-deny", "no-match-default-deny",
+	// or "emergency-exception-allow" when a temporary emergency
+	// exception overrides a published deny.
 	Reason string `json:"reason"`
 	// Considered lists every rule that matched the tuple, highest
 	// priority first. On a tie the winners group is also exposed.
 	Considered []RuleRef `json:"considered"`
 	// Winners are the rules at the decisive (highest matched) priority.
 	Winners []RuleRef `json:"winners"`
+	// BaseEvidence is present ONLY for an emergency-exception override.
+	// It preserves the original published ruling (decision, reason and
+	// full rule evidence), while Considered/Winners above keep showing
+	// the underlying rule chain. Decision == "allow" never appears
+	// without both this and Exception being set, so a UI can never render
+	// an allowed cell next to pure rule-deny evidence.
+	BaseEvidence *Evidence     `json:"baseEvidence,omitempty"`
+	Exception    *ExceptionRef `json:"exception,omitempty"`
 }
 
 // Tuple is one point of the finite decision domain.
@@ -32,9 +59,10 @@ type Tuple struct {
 }
 
 const (
-	ReasonSingleWinner = "single-winner"
-	ReasonTieDeny      = "tie-deny"
-	ReasonNoMatch      = "no-match-default-deny"
+	ReasonSingleWinner    = "single-winner"
+	ReasonTieDeny         = "tie-deny"
+	ReasonNoMatch         = "no-match-default-deny"
+	ReasonEmergencyExcept = "emergency-exception-allow"
 )
 
 // Engine holds precomputed indexes for one validated document.

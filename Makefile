@@ -13,6 +13,7 @@ build: web
 
 test:
 	$(GO) test -race -count=1 ./...
+	cd web && npm install --no-audit --no-fund >/dev/null && npm test
 
 dev-backend:
 	$(GO) run .

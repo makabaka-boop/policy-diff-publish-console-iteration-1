@@ -6,6 +6,7 @@ import DomainEditor from './components/DomainEditor.vue'
 import RuleEditor from './components/RuleEditor.vue'
 import PreviewPanel from './components/PreviewPanel.vue'
 import DecisionMatrix from './components/DecisionMatrix.vue'
+import ExceptionPanel from './components/ExceptionPanel.vue'
 
 const notice = ref('')
 const draftDoc = ref(null)
@@ -19,6 +20,10 @@ const publishing = ref(false)
 const message = ref(null) // { kind: 'ok' | 'err', text }
 const matrixBump = ref(0)
 const matrixVersion = ref('draft')
+// Bumped when the emergency-exception set changes or a publish/reset
+// invalidates it, so both the exception panel and the published matrix
+// re-read from one coherent server state.
+const exceptionBump = ref(0)
 
 let roleNameCounter = 0
 
@@ -122,13 +127,14 @@ async function publish() {
       publishedRevision: preview.value.publishedRevision,
       summary: preview.value.summary,
     })
-    flash('ok', `发布成功：新已发布修订 p${res.published.revision}`)
+    flash('ok', `发布成功：新已发布修订 p${res.published.revision}；旧应急例外已全部立即失效。`)
     await loadState()
     // The published content is now the just-published draft; regenerate
     // the preview so its revision pair reflects reality.
     preview.value = await api.preview()
     matrixVersion.value = 'published'
     matrixBump.value++
+    exceptionBump.value++
   } catch (e) {
     if (e.status === 409) {
       flash('err', `发布被拒绝（并发或过期）：${e.message}。请重新加载状态并重新预览。`)
@@ -154,12 +160,20 @@ async function resetDemo() {
     preview.value = null
     dirty.value = false
     matrixBump.value++
-    flash('ok', '已重置为内置菱形继承演示策略。')
+    exceptionBump.value++
+    flash('ok', '已重置为内置菱形继承演示策略；全部应急例外立即失效。')
   } catch (e) {
     flash('err', e.message)
   } finally {
     busy.value = false
   }
+}
+
+// An emergency exception was just created: refresh the published matrix
+// so it never shows a stale deny for a tuple the API now allows.
+function onExceptionCreated() {
+  exceptionBump.value++
+  if (matrixVersion.value === 'published') matrixBump.value++
 }
 
 onMounted(loadState)
@@ -221,6 +235,13 @@ onMounted(loadState)
         :can-publish="canPublish"
         @refresh="makePreview"
         @publish="publish"
+      />
+
+      <ExceptionPanel
+        :published-doc="publishedDoc"
+        :published-revision="publishedRevision"
+        :bump="exceptionBump"
+        @created="onExceptionCreated"
       />
 
       <div class="tabs">
